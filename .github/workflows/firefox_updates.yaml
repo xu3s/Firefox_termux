@@ -1,91 +1,71 @@
-name: Check & Update Firefox DEBs (Termux X11, Apt Method)
+name: Check Firefox Packages
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # Every 6 hours
+    - cron: "0 */6 * * *" # every 6 hours
   workflow_dispatch:
 
 jobs:
-  update-firefox:
+  check:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Tools
-        run: sudo apt-get install -y wget gzip
-
-      - name: Set Variables
-        id: vars
+      - name: Install dependencies
         run: |
-          echo "APT_REPO_URL=https://packages-cf.termux.dev/apt/termux-x11" >> $GITHUB_OUTPUT
-          echo "ARCHES=aarch64 arm x86_64 i686" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y wget gzip
 
-      - name: Loop Over Architectures
-        id: loop
+      - name: Run Firefox checker
+        id: check # add step id so we can read outputs
         run: |
-          updated_list=""
+          mkdir -p firefox/latest
 
-          for ARCH in ${{ steps.vars.outputs.ARCHES }}; do
-            echo "Processing arch: $ARCH"
+          ARCHS=("aarch64" "arm" "x86_64" "i686")
+          REPO_URL="https://packages-cf.termux.dev/apt/termux-x11/dists/x11/main"
 
-            # Download Packages.gz
-            wget -qO Packages.gz "${{ steps.vars.outputs.APT_REPO_URL }}/dists/x11/main/binary-${ARCH}/Packages.gz" || continue
-            zgrep -A 1 '^Package: firefox$' Packages.gz > firefox_versions.txt
+          updated=0
 
-            # Extract latest version and filename
-            latest_ver=$(awk '/^Package:/ {pkg=$2} /^Version:/ {ver=$2; if (pkg == "firefox") print ver}' firefox_versions.txt | sort -V | tail -n1)
-            deb_file=$(zgrep -A 20 "Package: firefox" Packages.gz | grep -E "Filename: .*/firefox_.*_${ARCH}\.deb" | grep "$latest_ver" | head -n1 | awk '{print $2}')
-            echo "Latest version for $ARCH: $latest_ver"
-            echo "DEB path: $deb_file"
+          for arch in "${ARCHS[@]}"; do
+            echo "Checking for $arch..."
 
-            # Skip if no .deb found
-            if [ -z "$deb_file" ]; then
-              echo "No .deb found for $ARCH"
-              continue
-            fi
+            wget -qO - "$REPO_URL/binary-$arch/Packages.gz" | zgrep -A 10 '^Package: firefox$' > tmp.txt
 
-            version_file="firefox/latest/firefox_version_${ARCH}.txt"
-            if [ -f "$version_file" ]; then
-              existing_ver=$(cat "$version_file")
+            version=$(grep '^Version:' tmp.txt | head -n1 | sed 's/Version: //')
+            filename=$(grep '^Filename:' tmp.txt | head -n1 | sed 's/Filename: //')
+
+            echo "Found version: $version"
+            echo "Filename: $filename"
+
+            verfile="firefox/latest/firefox_version_${arch}.txt"
+            debfile="firefox/latest/firefox_latest_${arch}.deb"
+
+            oldver=$(cat "$verfile" 2>/dev/null || echo "none")
+
+            if [ "$version" != "$oldver" ] || [ ! -f "$debfile" ]; then
+              echo "Updating $arch..."
+              wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
+              echo "$version" > "$verfile"
+              updated=1
             else
-              existing_ver="none"
-            fi
-            echo "Existing version for $ARCH: $existing_ver"
-
-            if [ "$latest_ver" != "$existing_ver" ]; then
-              echo "New version detected! Downloading..."
-              mkdir -p firefox/latest
-
-              wget -qO "firefox/latest/firefox_latest_${ARCH}.deb" "${{ steps.vars.outputs.APT_REPO_URL }}/$deb_file"
-
-              echo "$latest_ver" > "$version_file"
-
-              git add "firefox/latest/firefox_latest_${ARCH}.deb" "$version_file"
-
-              updated_list="$updated_list $ARCH:$latest_ver"
-            else
-              echo "No new version for $ARCH"
+              echo "$arch is already up to date."
             fi
 
-            rm -f Packages.gz firefox_versions.txt
+            rm -f tmp.txt
           done
 
-          echo "updated_list=$updated_list" >> $GITHUB_OUTPUT
+          echo "updated=$updated" >> $GITHUB_OUTPUT
 
-      - name: Commit Changes (if any)
-        if: steps.loop.outputs.updated_list != ''
+      - name: Commit changes
+        if: steps.check.outputs.updated == '1'
         run: |
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          msg="Update Firefox"
-          for entry in ${{ steps.loop.outputs.updated_list }}; do
-            arch=${entry%%:*}
-            ver=${entry##*:}
-            msg="$msg | $arch: $ver"
-          done
+          git add firefox/latest/*
+          version=$(cat firefox/latest/firefox_version_aarch64.txt)
+          git commit -m "Update Firefox to version $version"
 
-          git commit -m "$msg"
-          git push
+          git push "https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main
