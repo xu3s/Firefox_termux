@@ -2,7 +2,7 @@ name: Check Firefox Packages
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours starting from 00:00 UTC
+    - cron: "0 */6 * * *" # every 6 hours
   workflow_dispatch:
 
 jobs:
@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [aarch64, arm, x86_64, i686] # parallel jobs per arch
+        arch: [aarch64, arm, x86_64, i686]
+      fail-fast: false # Allow all jobs to run even if one fails
 
     steps:
       - name: Checkout repo
@@ -19,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gzip xz-utils zstd tar tree
+          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl
 
       - name: Run Firefox checker for ${{ matrix.arch }}
         id: check
@@ -38,7 +39,7 @@ jobs:
           echo "Found version: $version"
           echo "Filename: $filename"
 
-          # Check latest release version (if exists)
+          # Check latest release version (once per arch)
           latest_release_url="https://api.github.com/repos/${{ github.repository }}/releases/latest"
           latest_version=$(curl -s "$latest_release_url" | grep 'tag_name' | sed -E 's/.*"([^"]+)".*/\1/' || echo "none")
           echo "Latest release version: $latest_version"
@@ -49,19 +50,18 @@ jobs:
             debfile="firefox_${ARCH}.deb"
             wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
-            # Extract firefox folder from .deb
-            workdir="$(pwd)/deb_extract_temp_$ARCH"
+            # Extract
+            workdir="deb_extract_temp_$ARCH"
             rm -rf "$workdir" firefox
             mkdir -p "$workdir"
-            
             ar x "$debfile" --output="$workdir"
 
             if [ -f "$workdir/data.tar.xz" ]; then
-              tar -xvf "$workdir/data.tar.xz" -C "$workdir"
+              tar -xf "$workdir/data.tar.xz" -C "$workdir"
             elif [ -f "$workdir/data.tar.zst" ]; then
               tar --zstd -xf "$workdir/data.tar.zst" -C "$workdir"
             elif [ -f "$workdir/data.tar.gz" ]; then
-              tar -xvf "$workdir/data.tar.gz" -C "$workdir"
+              tar -xf "$workdir/data.tar.gz" -C "$workdir"
             else
               echo "Error: data.tar.* not found in the .deb"
               exit 1
@@ -78,26 +78,41 @@ jobs:
             tarfile="firefox_latest_${ARCH}.tar.xz"
             tar -cJf "$tarfile" firefox
 
-            # Clean up extracted files and deb
-            rm -rf "$workdir" "$debfile" firefox
+            rm -rf "$workdir" "$debfile" firefox tmp.txt
 
             echo "tarfile=$tarfile" >> $GITHUB_OUTPUT
             echo "version=$version" >> $GITHUB_OUTPUT
-            updated=1
+            echo "updated=1" >> $GITHUB_OUTPUT
           else
             echo "$ARCH is already up to date."
+            echo "updated=0" >> $GITHUB_OUTPUT
           fi
 
-          rm -f tmp.txt
-          echo "updated=$updated" >> $GITHUB_OUTPUT
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-      - name: Upload to release
-        if: steps.check.outputs.updated == '1'
+      - name: List files
+        run: ls -R artifacts
+
+      - name: Get version from one arch
+        id: version
+        run: |
+          version=$(ls artifacts/*/firefox_latest_*.tar.xz | head -n1 | sed -E 's/.*_(.*)\.tar\.xz/\1/')
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.check.outputs.version }}
-          name: "Firefox Termux ${{ steps.check.outputs.version }}"
-          files: ${{ steps.check.outputs.tarfile }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "Firefox Termux ${{ steps.version.outputs.version }}"
+          files: artifacts/*/firefox_latest_*.tar.xz
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
