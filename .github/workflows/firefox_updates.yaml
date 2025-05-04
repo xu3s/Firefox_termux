@@ -58,16 +58,18 @@ jobs:
             ar x "$debfile" --output="$workdir"
 
             if [ -f "$workdir/data.tar.xz" ]; then
-              tar -xf "$workdir/data.tar.xz" -C "$workdir"
+              tar -xvf "$workdir/data.tar.xz" -C "$workdir"
             elif [ -f "$workdir/data.tar.zst" ]; then
               tar --zstd -xf "$workdir/data.tar.zst" -C "$workdir"
             elif [ -f "$workdir/data.tar.gz" ]; then
-              tar -xf "$workdir/data.tar.gz" -C "$workdir"
+              tar -xvf "$workdir/data.tar.gz" -C "$workdir"
             else
               echo "Error: data.tar.* not found in the .deb"
               exit 1
             fi
 
+            echo $(pwd)
+            echo $(ls) 
             firefox_source="$workdir/data/data/com.termux/files/usr/lib/firefox"
             if [ -d "$firefox_source" ]; then
               cp -a "$firefox_source" "firefox"
@@ -75,6 +77,8 @@ jobs:
               echo "Error: Firefox folder not found at expected path"
               exit 1
             fi
+            echo "---------------"
+            echo $(ls)
 
             tar -cJf "$archivefile" firefox
 
