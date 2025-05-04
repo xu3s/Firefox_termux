@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gzip xz-utils zstd tar
+          sudo apt-get install -y wget gzip xz-utils zstd tar tree
 
       - name: Run Firefox checker for ${{ matrix.arch }}
         id: check
@@ -68,8 +68,8 @@ jobs:
               exit 1
             fi
 
-            echo $(pwd)
-            echo $(ls) 
+            pwd
+            ls
             firefox_source="$workdir/data/data/com.termux/files/usr/lib/firefox"
             if [ -d "$firefox_source" ]; then
               cp -a "$firefox_source" "firefox"
@@ -78,7 +78,9 @@ jobs:
               exit 1
             fi
             echo "---------------"
-            echo $(ls)
+            ls
+            echo "--------"
+            tree
 
             tar -cJf "$archivefile" firefox
 
