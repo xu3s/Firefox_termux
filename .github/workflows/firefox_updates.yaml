@@ -2,7 +2,7 @@ name: Check Firefox Packages
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours
+    - cron: "0 */6 * * *" # every 6 hours starting from 00:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -40,28 +40,28 @@ jobs:
           echo "Filename: $filename"
 
           verfile="firefox/latest/firefox_version_${ARCH}.txt"
-          archivefile="firefox_latest_${ARCH}.tar.xz"
+          archivefile="firefox/latest/firefox_latest_${ARCH}.tar.xz"
 
           oldver=$(cat "$verfile" 2>/dev/null || echo "none")
 
-          if [ "$version" != "$oldver" ]; then
+          if [ "$version" != "$oldver" ] || [ ! -f "$archivefile" ]; then
             echo "Updating $ARCH..."
 
             debfile="firefox_${ARCH}.deb"
             wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
             workdir="$(pwd)/deb_extract_temp_$ARCH"
-            rm -rf "$workdir"
+            rm -rf "$workdir" firefox
             mkdir -p "$workdir"
             
             ar x "$debfile" --output="$workdir"
 
             if [ -f "$workdir/data.tar.xz" ]; then
-              tar -xf "$workdir/data.tar.xz" -C "$workdir"
+              tar -xvf "$workdir/data.tar.xz" -C "$workdir"
             elif [ -f "$workdir/data.tar.zst" ]; then
               tar --zstd -xf "$workdir/data.tar.zst" -C "$workdir"
             elif [ -f "$workdir/data.tar.gz" ]; then
-              tar -xf "$workdir/data.tar.gz" -C "$workdir"
+              tar -xvf "$workdir/data.tar.gz" -C "$workdir"
             else
               echo "Error: data.tar.* not found in the .deb"
               exit 1
@@ -69,17 +69,17 @@ jobs:
 
             firefox_source="$workdir/data/data/com.termux/files/usr/lib/firefox"
             if [ -d "$firefox_source" ]; then
-              cp -a "$firefox_source" "./firefox_temp_$ARCH"
+              cp -a "$firefox_source" "firefox"
             else
               echo "Error: Firefox folder not found at expected path"
               exit 1
             fi
 
-            tar -cJf "$archivefile" "firefox_temp_$ARCH"
+            tar -cJf "$archivefile" firefox
+
+            rm -rf "$workdir" "$debfile" firefox
 
             echo "$version" > "$verfile"
-
-            rm -rf "$workdir" "$debfile" "firefox_temp_$ARCH"
             updated=1
           else
             echo "$ARCH is already up to date."
@@ -87,31 +87,49 @@ jobs:
 
           rm -f tmp.txt
           echo "updated=$updated" >> $GITHUB_OUTPUT
-          echo "version=$version" >> $GITHUB_OUTPUT
 
-      - name: Upload versioned Release
+      - name: Upload archive as artifact
         if: steps.check.outputs.updated == '1'
-        uses: softprops/action-gh-release@v2
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: firefox-${{ matrix.arch }}-v${{ steps.check.outputs.version }}
-          name: Firefox ${{ matrix.arch }} v${{ steps.check.outputs.version }}
-          files: firefox_latest_${{ matrix.arch }}.tar.xz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: firefox_${{ matrix.arch }}
+          path: |
+            firefox/latest/firefox_latest_${{ matrix.arch }}.tar.xz
+            firefox/latest/firefox_version_${{ matrix.arch }}.txt
 
-      - name: Update latest tag (firefox-${{ matrix.arch }}-latest)
-        if: steps.check.outputs.updated == '1'
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show downloaded files
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tree artifacts
 
-          tag_name="firefox-${{ matrix.arch }}-latest"
-
-          # Delete old latest tag if exists
-          git push --delete origin $tag_name || true
-
-          # Create lightweight latest tag and push
-          git tag $tag_name
-          git push origin $tag_name
+      - name: Delete existing latest release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release delete latest -y || echo "No existing release to delete"
+          git push --delete origin latest || echo "No existing tag to delete"
+
+      - name: Create new latest release with all archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create latest \
+            artifacts/firefox_aarch64/firefox_latest_aarch64.tar.xz \
+            artifacts/firefox_arm/firefox_latest_arm.tar.xz \
+            artifacts/firefox_x86_64/firefox_latest_x86_64.tar.xz \
+            artifacts/firefox_i686/firefox_latest_i686.tar.xz \
+            --title "Latest Firefox Archives" \
+            --notes "This release contains the latest Firefox builds for all supported architectures."
