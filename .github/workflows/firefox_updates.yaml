@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [aarch64, arm, x86_64, i686]
+        arch: [aarch64, arm, x86_64, i686] # parallel jobs per arch
 
     steps:
       - name: Checkout repo
@@ -25,7 +25,6 @@ jobs:
         id: check
         run: |
           ARCH="${{ matrix.arch }}"
-          mkdir -p firefox/latest
           REPO_URL="https://packages-cf.termux.dev/apt/termux-x11/dists/x11/main"
           updated=0
 
@@ -39,17 +38,18 @@ jobs:
           echo "Found version: $version"
           echo "Filename: $filename"
 
-          verfile="firefox/latest/firefox_version_${ARCH}.txt"
-          archivefile="firefox/latest/firefox_latest_${ARCH}.tar.xz"
+          # Check latest release version (if exists)
+          latest_release_url="https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          latest_version=$(curl -s "$latest_release_url" | grep 'tag_name' | sed -E 's/.*"([^"]+)".*/\1/' || echo "none")
+          echo "Latest release version: $latest_version"
 
-          oldver=$(cat "$verfile" 2>/dev/null || echo "none")
-
-          if [ "$version" != "$oldver" ] || [ ! -f "$archivefile" ]; then
+          if [ "$version" != "$latest_version" ]; then
             echo "Updating $ARCH..."
 
             debfile="firefox_${ARCH}.deb"
             wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
+            # Extract firefox folder from .deb
             workdir="$(pwd)/deb_extract_temp_$ARCH"
             rm -rf "$workdir" firefox
             mkdir -p "$workdir"
@@ -75,11 +75,14 @@ jobs:
               exit 1
             fi
 
-            tar -cJf "$archivefile" firefox
+            tarfile="firefox_latest_${ARCH}.tar.xz"
+            tar -cJf "$tarfile" firefox
 
+            # Clean up extracted files and deb
             rm -rf "$workdir" "$debfile" firefox
 
-            echo "$version" > "$verfile"
+            echo "tarfile=$tarfile" >> $GITHUB_OUTPUT
+            echo "version=$version" >> $GITHUB_OUTPUT
             updated=1
           else
             echo "$ARCH is already up to date."
@@ -88,48 +91,13 @@ jobs:
           rm -f tmp.txt
           echo "updated=$updated" >> $GITHUB_OUTPUT
 
-      - name: Upload archive as artifact
+      - name: Upload to release
         if: steps.check.outputs.updated == '1'
-        uses: actions/upload-artifact@v4
+        uses: softprops/action-gh-release@v2
         with:
-          name: firefox_${{ matrix.arch }}
-          path: |
-            firefox/latest/firefox_latest_${{ matrix.arch }}.tar.xz
-            firefox/latest/firefox_version_${{ matrix.arch }}.txt
-
-  release:
-    needs: check
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Show downloaded files
-        run: |
-          tree artifacts
-
-      - name: Delete existing latest release
+          tag_name: ${{ steps.check.outputs.version }}
+          name: "Firefox Termux ${{ steps.check.outputs.version }}"
+          files: ${{ steps.check.outputs.tarfile }}
+          fail_on_unmatched_files: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          gh release delete latest -y || echo "No existing release to delete"
-          git push --delete origin latest || echo "No existing tag to delete"
-
-      - name: Create new latest release with all archives
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create latest \
-            artifacts/firefox_aarch64/firefox_latest_aarch64.tar.xz \
-            artifacts/firefox_arm/firefox_latest_arm.tar.xz \
-            artifacts/firefox_x86_64/firefox_latest_x86_64.tar.xz \
-            artifacts/firefox_i686/firefox_latest_i686.tar.xz \
-            --title "Latest Firefox Archives" \
-            --notes "This release contains the latest Firefox builds for all supported architectures."
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
