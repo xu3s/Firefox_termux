@@ -2,12 +2,15 @@ name: Check Firefox Packages
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours
+    - cron: "0 */6 * * *" # every 6 hours starting from 00:00 UTC
   workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [aarch64, arm, x86_64, i686] # parallel jobs per arch
 
     steps:
       - name: Checkout repo
@@ -18,117 +21,74 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y wget gzip xz-utils zstd tar
 
-      - name: Run Firefox checker
+      - name: Run Firefox checker for ${{ matrix.arch }}
         id: check
         run: |
+          ARCH="${{ matrix.arch }}"
           mkdir -p firefox/latest
-          ARCHS=("aarch64" "arm" "x86_64" "i686")
           REPO_URL="https://packages-cf.termux.dev/apt/termux-x11/dists/x11/main"
           updated=0
 
-          for arch in "${ARCHS[@]}"; do
-            echo "Checking for $arch..."
+          echo "Checking for $ARCH..."
 
-            wget -qO - "$REPO_URL/binary-$arch/Packages.gz" | zgrep -A 10 '^Package: firefox$' > tmp.txt
+          wget -qO - "$REPO_URL/binary-$ARCH/Packages.gz" | zgrep -A 10 '^Package: firefox$' > tmp.txt
 
-            version=$(grep '^Version:' tmp.txt | head -n1 | sed 's/Version: //')
-            filename=$(grep '^Filename:' tmp.txt | head -n1 | sed 's/Filename: //')
+          version=$(grep '^Version:' tmp.txt | head -n1 | sed 's/Version: //')
+          filename=$(grep '^Filename:' tmp.txt | head -n1 | sed 's/Filename: //')
 
-            echo "Found version: $version"
-            echo "Filename: $filename"
+          echo "Found version: $version"
+          echo "Filename: $filename"
 
-            verfile="firefox/latest/firefox_version_${arch}.txt"
-            archivefile="firefox/latest/firefox_latest_${arch}.tar.xz"
+          verfile="firefox/latest/firefox_version_${ARCH}.txt"
+          archivefile="firefox/latest/firefox_latest_${ARCH}.tar.xz"
 
-            oldver=$(cat "$verfile" 2>/dev/null || echo "none")
+          oldver=$(cat "$verfile" 2>/dev/null || echo "none")
 
-            if [ "$version" != "$oldver" ] || [ ! -f "$archivefile" ]; then
-              echo "Updating $arch..."
-              
-              debfile="firefox_${arch}.deb"
-              wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
+          if [ "$version" != "$oldver" ] || [ ! -f "$archivefile" ]; then
+            echo "Updating $ARCH..."
 
-              # Extract firefox folder from .deb and compress
-              workdir="deb_extract_temp"
-              rm -rf "$workdir" firefox
-              mkdir "$workdir"
-              cd "$workdir"
+            debfile="firefox_${ARCH}.deb"
+            wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
-              ar x "../$debfile"
+            # Extract firefox folder from .deb
+            workdir="$(pwd)/deb_extract_temp_$ARCH"
+            rm -rf "$workdir" firefox
+            mkdir -p "$workdir"
+            
+            ar x "$debfile" --output="$workdir"
 
-              if [ -f data.tar.xz ]; then
-                tar -xf data.tar.xz
-              elif [ -f data.tar.zst ]; then
-                tar --zstd -xf data.tar.zst
-              elif [ -f data.tar.gz ]; then
-                tar -xf data.tar.gz
-              else
-                echo "Error: data.tar.* not found in the .deb"
-                exit 1
-              fi
-
-              firefox_source="data/data/com.termux/files/usr/lib/firefox"
-              if [ -d "$firefox_source" ]; then
-                cp -a "$firefox_source" ../firefox
-              else
-                echo "Error: Firefox folder not found at expected path"
-                exit 1
-              fi
-
-              cd ..
-              tar -cJf "$archivefile" firefox
-
-              # Clean up extracted files and deb
-              rm -rf "$workdir" "$debfile" firefox
-
-              echo "$version" > "$verfile"
-              updated=1
+            if [ -f "$workdir/data.tar.xz" ]; then
+              tar -xf "$workdir/data.tar.xz" -C "$workdir"
+            elif [ -f "$workdir/data.tar.zst" ]; then
+              tar --zstd -xf "$workdir/data.tar.zst" -C "$workdir"
+            elif [ -f "$workdir/data.tar.gz" ]; then
+              tar -xf "$workdir/data.tar.gz" -C "$workdir"
             else
-              echo "$arch is already up to date."
+              echo "Error: data.tar.* not found in the .deb"
+              exit 1
             fi
 
-            rm -f tmp.txt
-          done
+            firefox_source="$workdir/data/data/com.termux/files/usr/lib/firefox"
+            if [ -d "$firefox_source" ]; then
+              cp -a "$firefox_source" "firefox"
+            else
+              echo "Error: Firefox folder not found at expected path"
+              exit 1
+            fi
 
+            tar -cJf "$archivefile" firefox
+
+            # Clean up extracted files and deb
+            rm -rf "$workdir" "$debfile" firefox
+
+            echo "$version" > "$verfile"
+            updated=1
+          else
+            echo "$ARCH is already up to date."
+          fi
+
+          rm -f tmp.txt
           echo "updated=$updated" >> $GITHUB_OUTPUT
-
-      - name: Cleanup old files
-        if: steps.check.outputs.updated == '1'
-        run: |
-          echo "Cleaning up any old files not matching current arch list..."
-          cd firefox/latest
-
-          ARCHS=("aarch64" "arm" "x86_64" "i686")
-
-          # Clean old .tar.xz
-          for f in firefox_latest_*.tar.xz; do
-            found=0
-            for arch in "${ARCHS[@]}"; do
-              if [[ "$f" == "firefox_latest_${arch}.tar.xz" ]]; then
-                found=1
-                break
-              fi
-            done
-            if [ "$found" -eq 0 ]; then
-              echo "Removing old archive: $f"
-              rm -f "$f"
-            fi
-          done
-
-          # Clean old version txt
-          for f in firefox_version_*.txt; do
-            found=0
-            for arch in "${ARCHS[@]}"; do
-              if [[ "$f" == "firefox_version_${arch}.txt" ]]; then
-                found=1
-                break
-              fi
-            done
-            if [ "$found" -eq 0 ]; then
-              echo "Removing old version file: $f"
-              rm -f "$f"
-            fi
-          done
 
       - name: Commit and push archives to artifacts branch
         if: steps.check.outputs.updated == '1'
@@ -139,12 +99,12 @@ jobs:
           # Clone artifacts branch only
           git clone --single-branch --branch artifacts "https://github.com/${{ github.repository }}.git" artifacts_branch
 
-          # Copy updated archives into it
-          cp firefox/latest/*.tar.xz artifacts_branch/
-          cp firefox/latest/*.txt artifacts_branch/
+          # Copy updated archive and version file
+          cp firefox/latest/firefox_latest_${{ matrix.arch }}.tar.xz artifacts_branch/
+          cp firefox/latest/firefox_version_${{ matrix.arch }}.txt artifacts_branch/
 
           cd artifacts_branch
-          git add .  # add .tar.xz and .txt files
-          version=$(cat firefox_version_aarch64.txt || echo "unknown")
-          git commit -m "Update Firefox archives to version $version" || echo "Nothing to commit"
+          git add firefox_latest_${{ matrix.arch }}.tar.xz firefox_version_${{ matrix.arch }}.txt
+          version=$(cat firefox_version_${{ matrix.arch }}.txt || echo "unknown")
+          git commit -m "Update Firefox ${{ matrix.arch }} to version $version" || echo "Nothing to commit"
           git push "https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" artifacts
