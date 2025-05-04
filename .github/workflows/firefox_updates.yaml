@@ -11,7 +11,7 @@ jobs:
     strategy:
       matrix:
         arch: [aarch64, arm, x86_64, i686]
-      fail-fast: false # Allow all jobs to run even if one fails
+      fail-fast: false
 
     steps:
       - name: Checkout repo
@@ -39,7 +39,6 @@ jobs:
           echo "Found version: $version"
           echo "Filename: $filename"
 
-          # Check latest release version (once per arch)
           latest_release_url="https://api.github.com/repos/${{ github.repository }}/releases/latest"
           latest_version=$(curl -s "$latest_release_url" | grep 'tag_name' | sed -E 's/.*"([^"]+)".*/\1/' || echo "none")
           echo "Latest release version: $latest_version"
@@ -50,7 +49,6 @@ jobs:
             debfile="firefox_${ARCH}.deb"
             wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
-            # Extract
             workdir="deb_extract_temp_$ARCH"
             rm -rf "$workdir" firefox
             mkdir -p "$workdir"
@@ -86,12 +84,17 @@ jobs:
           else
             echo "$ARCH is already up to date."
             echo "updated=0" >> $GITHUB_OUTPUT
-          fi
+
+      - name: Upload artifact
+        if: steps.check.outputs.updated == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: ${{ steps.check.outputs.tarfile }}
 
   release:
     needs: check
     runs-on: ubuntu-latest
-    if: ${{ always() }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -99,20 +102,45 @@ jobs:
           path: artifacts
 
       - name: List files
-        run: ls -R artifacts
+        run: ls -R artifacts || echo "No artifacts"
 
-      - name: Get version from one arch
+      - name: Decide whether to release # 🔥 SMART SKIP LOGIC
+        id: decide
+        run: |
+          artifact_count=$(find artifacts -name 'firefox_latest_*.tar.xz' | wc -l)
+          echo "Found $artifact_count updated artifacts."
+
+          # Detect if manual dispatch (force release)
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual run detected → force release."
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          elif [ "$artifact_count" -eq 0 ]; then
+            echo "Nothing updated, skip release."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Updates found → proceed with release."
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get version for tag
         id: version
         run: |
-          version=$(ls artifacts/*/firefox_latest_*.tar.xz | head -n1 | sed -E 's/.*_(.*)\.tar\.xz/\1/')
+          first_file=$(find artifacts -name 'firefox_latest_*.tar.xz' | head -n1)
+          if [ -n "$first_file" ]; then
+            version=$(basename "$first_file" | sed -E 's/^firefox_latest_.*\.tar\.xz$/'"$(date +%Y.%m.%d)"'/')
+          else
+            version="$(date +%Y.%m.%d)"
+          fi
+          echo "version=$version"
           echo "version=$version" >> $GITHUB_OUTPUT
 
-      - name: Create or update release
+      - name: Create GitHub Release
+        if: steps.decide.outputs.proceed == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: "Firefox Termux ${{ steps.version.outputs.version }}"
           files: artifacts/*/firefox_latest_*.tar.xz
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
