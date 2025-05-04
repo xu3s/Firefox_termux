@@ -2,7 +2,7 @@ name: Check Firefox Packages
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours starting from 00:00 UTC
+    - cron: "0 */6 * * *" # every 6 hours
   workflow_dispatch:
 
 jobs:
@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [aarch64, arm, x86_64, i686] # parallel jobs per arch
+        arch: [aarch64, arm, x86_64, i686]
 
     steps:
       - name: Checkout repo
@@ -40,54 +40,46 @@ jobs:
           echo "Filename: $filename"
 
           verfile="firefox/latest/firefox_version_${ARCH}.txt"
-          archivefile="firefox/latest/firefox_latest_${ARCH}.tar.xz"
+          archivefile="firefox_latest_${ARCH}.tar.xz"
 
           oldver=$(cat "$verfile" 2>/dev/null || echo "none")
 
-          if [ "$version" != "$oldver" ] || [ ! -f "$archivefile" ]; then
+          if [ "$version" != "$oldver" ]; then
             echo "Updating $ARCH..."
 
             debfile="firefox_${ARCH}.deb"
             wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
-            # Extract firefox folder from .deb
             workdir="$(pwd)/deb_extract_temp_$ARCH"
-            rm -rf "$workdir" firefox
+            rm -rf "$workdir"
             mkdir -p "$workdir"
             
             ar x "$debfile" --output="$workdir"
 
             if [ -f "$workdir/data.tar.xz" ]; then
-              tar -xvf "$workdir/data.tar.xz" -C "$workdir"
+              tar -xf "$workdir/data.tar.xz" -C "$workdir"
             elif [ -f "$workdir/data.tar.zst" ]; then
               tar --zstd -xf "$workdir/data.tar.zst" -C "$workdir"
             elif [ -f "$workdir/data.tar.gz" ]; then
-              tar -xvf "$workdir/data.tar.gz" -C "$workdir"
+              tar -xf "$workdir/data.tar.gz" -C "$workdir"
             else
               echo "Error: data.tar.* not found in the .deb"
               exit 1
             fi
 
-            pwd
-            ls
             firefox_source="$workdir/data/data/com.termux/files/usr/lib/firefox"
             if [ -d "$firefox_source" ]; then
-              cp -a "$firefox_source" "firefox"
+              cp -a "$firefox_source" "./firefox_temp_$ARCH"
             else
               echo "Error: Firefox folder not found at expected path"
               exit 1
             fi
-            echo "---------------"
-            ls
-            echo "--------"
-            tree
 
-            tar -cJf "$archivefile" firefox
-
-            # Clean up extracted files and deb
-            rm -rf "$workdir" "$debfile" firefox
+            tar -cJf "$archivefile" "firefox_temp_$ARCH"
 
             echo "$version" > "$verfile"
+
+            rm -rf "$workdir" "$debfile" "firefox_temp_$ARCH"
             updated=1
           else
             echo "$ARCH is already up to date."
@@ -95,22 +87,31 @@ jobs:
 
           rm -f tmp.txt
           echo "updated=$updated" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
 
-      - name: Commit and push archives to artifacts branch
+      - name: Upload versioned Release
+        if: steps.check.outputs.updated == '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: firefox-${{ matrix.arch }}-v${{ steps.check.outputs.version }}
+          name: Firefox ${{ matrix.arch }} v${{ steps.check.outputs.version }}
+          files: firefox_latest_${{ matrix.arch }}.tar.xz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update latest tag (firefox-${{ matrix.arch }}-latest)
         if: steps.check.outputs.updated == '1'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Clone artifacts branch only
-          git clone --single-branch --branch artifacts "https://github.com/${{ github.repository }}.git" artifacts_branch
+          tag_name="firefox-${{ matrix.arch }}-latest"
 
-          # Copy updated archive and version file
-          cp firefox/latest/firefox_latest_${{ matrix.arch }}.tar.xz artifacts_branch/
-          cp firefox/latest/firefox_version_${{ matrix.arch }}.txt artifacts_branch/
+          # Delete old latest tag if exists
+          git push --delete origin $tag_name || true
 
-          cd artifacts_branch
-          git add firefox_latest_${{ matrix.arch }}.tar.xz firefox_version_${{ matrix.arch }}.txt
-          version=$(cat firefox_version_${{ matrix.arch }}.txt || echo "unknown")
-          git commit -m "Update Firefox ${{ matrix.arch }} to version $version" || echo "Nothing to commit"
-          git push "https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" artifacts
+          # Create lightweight latest tag and push
+          git tag $tag_name
+          git push origin $tag_name
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
