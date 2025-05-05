@@ -1,81 +1,193 @@
-release:
-  needs: check
-  runs-on: ubuntu-latest
-  steps:
-    - name: Download artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+name: Check Firefox Packages
 
-    - name: List files
-      run: ls -R artifacts || echo "No artifacts"
+on:
+  schedule:
+    - cron: "0 */6 * * *" # every 6 hours
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Optional revision number (e.g., 1, 2, 3)."
+        required: false
 
-    - name: Decide whether to release
-      id: decide
-      run: |
-        artifact_count=$(find artifacts -name 'firefox_latest_*.tar.xz' | wc -l)
-        echo "Found $artifact_count updated artifacts."
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [aarch64, arm, x86_64, i686]
+      fail-fast: false
 
-        if [ "$artifact_count" -eq 0 ]; then
-          echo "Nothing updated, skip release."
-          echo "proceed=false" >> $GITHUB_OUTPUT
-        else
-          echo "Updates found → proceed with release."
-          echo "proceed=true" >> $GITHUB_OUTPUT
-        fi
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Get version for tag
-      id: version
-      run: |
-        # Get upstream version (all artifacts have same version)
-        upstream_version=$(find artifacts -name 'firefox_latest_*.tar.xz' | head -n1 | sed -E 's|.*/firefox_latest_.*\.tar\.xz$||')
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl jq
 
-        # Get latest tag
-        latest_release_json=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest")
-        latest_tag=$(echo "$latest_release_json" | jq -r .tag_name)
-        echo "Latest GitHub release tag: $latest_tag"
+      - name: Run Firefox checker for ${{ matrix.arch }}
+        id: check
+        run: |
+          ARCH="${{ matrix.arch }}"
+          REPO_URL="https://packages-cf.termux.dev/apt/termux-x11/dists/x11/main"
+          updated=0
 
-        latest_version_only=$(echo "$latest_tag" | sed 's/_.*//')
-        latest_revision=$(echo "$latest_tag" | grep -o '_.*' | sed 's/_//')
+          echo "Checking for $ARCH..."
 
-        # Get revision input (if manual run)
-        revision_input="${{ github.event.inputs.revision }}"
+          wget -qO - "$REPO_URL/binary-$ARCH/Packages.gz" | zgrep -A 10 '^Package: firefox$' > tmp.txt
 
-        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          if [ -n "$revision_input" ]; then
-            tag="${upstream_version}_$revision_input"
+          version=$(grep '^Version:' tmp.txt | head -n1 | sed 's/Version: //')
+          filename=$(grep '^Filename:' tmp.txt | head -n1 | sed 's/Filename: //')
+
+          echo "Found upstream version: $version"
+          echo "Filename: $filename"
+
+          # Get latest tag
+          latest_release_json=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          latest_tag=$(echo "$latest_release_json" | jq -r .tag_name)
+          echo "Latest GitHub release tag: $latest_tag"
+
+          # Extract version part from tag (e.g., from 138.0.1_2 → 138.0.1)
+          latest_version_only=$(echo "$latest_tag" | sed 's/_.*//')
+          echo "Latest released upstream version: $latest_version_only"
+
+          # For manual dispatch, force update
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual run → force release"
+            updated=1
+          elif [ "$version" != "$latest_version_only" ]; then
+            echo "New upstream version detected → release"
+            updated=1
           else
-            # Auto bump: increment last revision if same version
-            if [ "$upstream_version" == "$latest_version_only" ]; then
-              new_rev=$((latest_revision + 1))
-              tag="${upstream_version}_$new_rev"
-            else
-              tag="$upstream_version"
-            fi
+            echo "$ARCH is already up to date."
           fi
-        else
-          tag="$upstream_version"
-        fi
 
-        echo "Chosen tag: $tag"
-        echo "tag=$tag" >> $GITHUB_OUTPUT
+          if [ "$updated" -eq 1 ]; then
+            debfile="firefox_${ARCH}.deb"
+            wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
-    - name: Create and push Git tag
-      if: steps.decide.outputs.proceed == 'true'
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git fetch --tags
-        git tag ${{ steps.version.outputs.tag }}
-        git push origin ${{ steps.version.outputs.tag }}
+            workdir="deb_extract_temp_$ARCH"
+            rm -rf "$workdir" firefox
+            mkdir -p "$workdir"
+            ar x "$debfile" --output="$workdir"
 
-    - name: Create GitHub Release
-      if: steps.decide.outputs.proceed == 'true'
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.version.outputs.tag }}
-        name: "Firefox Termux ${{ steps.version.outputs.tag }}"
-        files: artifacts/*/firefox_latest_*.tar.xz
-        fail_on_unmatched_files: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            if [ -f "$workdir/data.tar.xz" ]; then
+              tar -xf "$workdir/data.tar.xz" -C "$workdir"
+            elif [ -f "$workdir/data.tar.zst" ]; then
+              tar --zstd -xf "$workdir/data.tar.zst" -C "$workdir"
+            elif [ -f "$workdir/data.tar.gz" ]; then
+              tar -xf "$workdir/data.tar.gz" -C "$workdir"
+            else
+              echo "Error: data.tar.* not found in the .deb"
+              exit 1
+            fi
+
+            firefox_source="$workdir/data/data/com.termux/files/usr/lib/firefox"
+            if [ -d "$firefox_source" ]; then
+              cp -a "$firefox_source" "firefox"
+            else
+              echo "Error: Firefox folder not found at expected path"
+              exit 1
+            fi
+
+            tarfile="firefox_latest_${ARCH}.tar.xz"
+            tar -cJf "$tarfile" firefox
+
+            rm -rf "$workdir" "$debfile" firefox tmp.txt
+
+            echo "tarfile=$tarfile" >> $GITHUB_OUTPUT
+            echo "version=$version" >> $GITHUB_OUTPUT
+            echo "updated=1" >> $GITHUB_OUTPUT
+          fi
+
+          echo "updated=$updated" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        if: steps.check.outputs.updated == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: ${{ steps.check.outputs.tarfile }}
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List files
+        run: ls -R artifacts || echo "No artifacts"
+
+      - name: Decide whether to release
+        id: decide
+        run: |
+          artifact_count=$(find artifacts -name 'firefox_latest_*.tar.xz' | wc -l)
+          echo "Found $artifact_count updated artifacts."
+
+          if [ "$artifact_count" -eq 0 ]; then
+            echo "Nothing updated, skip release."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Updates found → proceed with release."
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get version for tag
+        id: version
+        run: |
+          # Get upstream version (all artifacts have same version)
+          upstream_version=$(find artifacts -name 'firefox_latest_*.tar.xz' | head -n1 | sed -E 's|.*/firefox_latest_.*\.tar\.xz$||')
+
+          # Get latest tag
+          latest_release_json=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          latest_tag=$(echo "$latest_release_json" | jq -r .tag_name)
+          echo "Latest GitHub release tag: $latest_tag"
+
+          latest_version_only=$(echo "$latest_tag" | sed 's/_.*//')
+          latest_revision=$(echo "$latest_tag" | grep -o '_.*' | sed 's/_//')
+
+          # Get revision input (if manual run)
+          revision_input="${{ github.event.inputs.revision }}"
+
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ -n "$revision_input" ]; then
+              tag="${upstream_version}_$revision_input"
+            else
+              # Auto bump: increment last revision if same version
+              if [ "$upstream_version" == "$latest_version_only" ]; then
+                new_rev=$((latest_revision + 1))
+                tag="${upstream_version}_$new_rev"
+              else
+                tag="$upstream_version"
+              fi
+            fi
+          else
+            tag="$upstream_version"
+          fi
+
+          echo "Chosen tag: $tag"
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+
+      - name: Create and push Git tag
+        if: steps.decide.outputs.proceed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags
+          git tag ${{ steps.version.outputs.tag }}
+          git push origin ${{ steps.version.outputs.tag }}
+
+      - name: Create GitHub Release
+        if: steps.decide.outputs.proceed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Firefox Termux ${{ steps.version.outputs.tag }}"
+          files: artifacts/*/firefox_latest_*.tar.xz
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
