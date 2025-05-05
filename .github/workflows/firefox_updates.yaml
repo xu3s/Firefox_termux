@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: "0 */6 * * *" # every 6 hours
   workflow_dispatch:
+    inputs:
+      revision:
+        description: "Optional revision number (e.g., 1, 2, 3)."
+        required: false
 
 jobs:
   check:
@@ -20,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl
+          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl jq
 
       - name: Run Firefox checker for ${{ matrix.arch }}
         id: check
@@ -36,16 +40,30 @@ jobs:
           version=$(grep '^Version:' tmp.txt | head -n1 | sed 's/Version: //')
           filename=$(grep '^Filename:' tmp.txt | head -n1 | sed 's/Filename: //')
 
-          echo "Found version: $version"
+          echo "Found upstream version: $version"
           echo "Filename: $filename"
 
-          latest_release_url="https://api.github.com/repos/${{ github.repository }}/releases/latest"
-          latest_version=$(curl -s "$latest_release_url" | grep 'tag_name' | sed -E 's/.*"([^"]+)".*/\1/' || echo "none")
-          echo "Latest release version: $latest_version"
+          # Get latest tag
+          latest_release_json=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          latest_tag=$(echo "$latest_release_json" | jq -r .tag_name)
+          echo "Latest GitHub release tag: $latest_tag"
 
-          if [ "$version" != "$latest_version" ]; then
-            echo "Updating $ARCH..."
+          # Extract version part from tag (e.g., from 138.0.1_2 → 138.0.1)
+          latest_version_only=$(echo "$latest_tag" | sed 's/_.*//')
+          echo "Latest released upstream version: $latest_version_only"
 
+          # For manual dispatch, force update
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual run → force release"
+            updated=1
+          elif [ "$version" != "$latest_version_only" ]; then
+            echo "New upstream version detected → release"
+            updated=1
+          else
+            echo "$ARCH is already up to date."
+          fi
+
+          if [ "$updated" -eq 1 ]; then
             debfile="firefox_${ARCH}.deb"
             wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
@@ -81,10 +99,9 @@ jobs:
             echo "tarfile=$tarfile" >> $GITHUB_OUTPUT
             echo "version=$version" >> $GITHUB_OUTPUT
             echo "updated=1" >> $GITHUB_OUTPUT
-          else
-            echo "$ARCH is already up to date."
-            echo "updated=0" >> $GITHUB_OUTPUT
           fi
+
+          echo "updated=$updated" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
         if: steps.check.outputs.updated == '1'
@@ -105,17 +122,13 @@ jobs:
       - name: List files
         run: ls -R artifacts || echo "No artifacts"
 
-      - name: Decide whether to release # 🔥 SMART SKIP LOGIC
+      - name: Decide whether to release
         id: decide
         run: |
           artifact_count=$(find artifacts -name 'firefox_latest_*.tar.xz' | wc -l)
           echo "Found $artifact_count updated artifacts."
 
-          # Detect if manual dispatch (force release)
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "Manual run detected → force release."
-            echo "proceed=true" >> $GITHUB_OUTPUT
-          elif [ "$artifact_count" -eq 0 ]; then
+          if [ "$artifact_count" -eq 0 ]; then
             echo "Nothing updated, skip release."
             echo "proceed=false" >> $GITHUB_OUTPUT
           else
@@ -126,21 +139,45 @@ jobs:
       - name: Get version for tag
         id: version
         run: |
-          first_file=$(find artifacts -name 'firefox_latest_*.tar.xz' | head -n1)
-          if [ -n "$first_file" ]; then
-            version=$(basename "$first_file" | sed -E 's/^firefox_latest_.*\.tar\.xz$/'"$(date +%Y.%m.%d)"'/')
+          # Get upstream version (all artifacts have same version)
+          upstream_version=$(find artifacts -name 'firefox_latest_*.tar.xz' | head -n1 | sed -E 's|.*/firefox_latest_.*\.tar\.xz$||')
+
+          # Get latest tag
+          latest_release_json=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          latest_tag=$(echo "$latest_release_json" | jq -r .tag_name)
+          echo "Latest GitHub release tag: $latest_tag"
+
+          latest_version_only=$(echo "$latest_tag" | sed 's/_.*//')
+          latest_revision=$(echo "$latest_tag" | grep -o '_.*' | sed 's/_//')
+
+          # Get revision input (if manual run)
+          revision_input="${{ github.event.inputs.revision }}"
+
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ -n "$revision_input" ]; then
+              tag="${upstream_version}_$revision_input"
+            else
+              # Auto bump: increment last revision if same version
+              if [ "$upstream_version" == "$latest_version_only" ]; then
+                new_rev=$((latest_revision + 1))
+                tag="${upstream_version}_$new_rev"
+              else
+                tag="$upstream_version"
+              fi
+            fi
           else
-            version="$(date +%Y.%m.%d)"
+            tag="$upstream_version"
           fi
-          echo "version=$version"
-          echo "version=$version" >> $GITHUB_OUTPUT
+
+          echo "Chosen tag: $tag"
+          echo "tag=$tag" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         if: steps.decide.outputs.proceed == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: "Firefox Termux ${{ steps.version.outputs.version }}"
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Firefox Termux ${{ steps.version.outputs.tag }}"
           files: artifacts/*/firefox_latest_*.tar.xz
           fail_on_unmatched_files: false
         env:
