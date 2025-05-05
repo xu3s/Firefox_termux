@@ -84,6 +84,7 @@ jobs:
           else
             echo "$ARCH is already up to date."
             echo "updated=0" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload artifact
         if: steps.check.outputs.updated == '1'
