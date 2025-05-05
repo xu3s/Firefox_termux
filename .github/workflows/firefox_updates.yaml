@@ -4,10 +4,6 @@ on:
   schedule:
     - cron: "0 */6 * * *" # every 6 hours
   workflow_dispatch:
-    inputs:
-      revision:
-        description: "Optional revision number (e.g., 1, 2, 3)."
-        required: false
 
 jobs:
   check:
@@ -24,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl jq
+          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl
 
       - name: Run Firefox checker for ${{ matrix.arch }}
         id: check
@@ -40,30 +36,16 @@ jobs:
           version=$(grep '^Version:' tmp.txt | head -n1 | sed 's/Version: //')
           filename=$(grep '^Filename:' tmp.txt | head -n1 | sed 's/Filename: //')
 
-          echo "Found upstream version: $version"
+          echo "Found version: $version"
           echo "Filename: $filename"
 
-          # Get latest tag
-          latest_release_json=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest")
-          latest_tag=$(echo "$latest_release_json" | jq -r .tag_name)
-          echo "Latest GitHub release tag: $latest_tag"
+          # Get latest release tag
+          latest_release_url="https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          latest_version=$(curl -s "$latest_release_url" | jq -r '.tag_name // ""')
+          echo "Latest release version: ${latest_version:-none}"
 
-          # Extract version part from tag (e.g., from 138.0.1_2 → 138.0.1)
-          latest_version_only=$(echo "$latest_tag" | sed 's/_.*//')
-          echo "Latest released upstream version: $latest_version_only"
-
-          # For manual dispatch, force update
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "Manual run → force release"
-            updated=1
-          elif [ "$version" != "$latest_version_only" ]; then
-            echo "New upstream version detected → release"
-            updated=1
-          else
-            echo "$ARCH is already up to date."
-          fi
-
-          if [ "$updated" -eq 1 ]; then
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] || [ "$version" != "$latest_version" ]; then
+            echo "Updating $ARCH..."
             debfile="firefox_${ARCH}.deb"
             wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
 
@@ -99,9 +81,10 @@ jobs:
             echo "tarfile=$tarfile" >> $GITHUB_OUTPUT
             echo "version=$version" >> $GITHUB_OUTPUT
             echo "updated=1" >> $GITHUB_OUTPUT
+          else
+            echo "$ARCH is already up to date."
+            echo "updated=0" >> $GITHUB_OUTPUT
           fi
-
-          echo "updated=$updated" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
         if: steps.check.outputs.updated == '1'
@@ -128,7 +111,10 @@ jobs:
           artifact_count=$(find artifacts -name 'firefox_latest_*.tar.xz' | wc -l)
           echo "Found $artifact_count updated artifacts."
 
-          if [ "$artifact_count" -eq 0 ]; then
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual run detected → force release."
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          elif [ "$artifact_count" -eq 0 ]; then
             echo "Nothing updated, skip release."
             echo "proceed=false" >> $GITHUB_OUTPUT
           else
@@ -139,47 +125,16 @@ jobs:
       - name: Get version for tag
         id: version
         run: |
-          # Get upstream version (all artifacts have same version)
-          upstream_version=$(find artifacts -name 'firefox_latest_*.tar.xz' | head -n1 | sed -E 's|.*/firefox_latest_.*\.tar\.xz$||')
+          # Get version from first artifact (all should have same version)
+          version="${{ needs.check.outputs.version }}"
 
-          # Get latest tag
-          latest_release_json=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest")
-          latest_tag=$(echo "$latest_release_json" | jq -r .tag_name)
-          echo "Latest GitHub release tag: $latest_tag"
-
-          latest_version_only=$(echo "$latest_tag" | sed 's/_.*//')
-          latest_revision=$(echo "$latest_tag" | grep -o '_.*' | sed 's/_//')
-
-          # Get revision input (if manual run)
-          revision_input="${{ github.event.inputs.revision }}"
-
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            if [ -n "$revision_input" ]; then
-              tag="${upstream_version}_$revision_input"
-            else
-              # Auto bump: increment last revision if same version
-              if [ "$upstream_version" == "$latest_version_only" ]; then
-                new_rev=$((latest_revision + 1))
-                tag="${upstream_version}_$new_rev"
-              else
-                tag="$upstream_version"
-              fi
-            fi
-          else
-            tag="$upstream_version"
+          if [ -z "$version" ]; then
+            echo "Error: Could not determine version"
+            exit 1
           fi
 
-          echo "Chosen tag: $tag"
-          echo "tag=$tag" >> $GITHUB_OUTPUT
-
-      - name: Create and push Git tag
-        if: steps.decide.outputs.proceed == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch --tags
-          git tag ${{ steps.version.outputs.tag }}
-          git push origin ${{ steps.version.outputs.tag }}
+          echo "Using version: $version"
+          echo "tag=$version" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         if: steps.decide.outputs.proceed == 'true'
