@@ -20,78 +20,78 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl
+          sudo apt-get install -y wget gzip xz-utils zstd tar tree curl jq
 
-      - name: Run Firefox checker for ${{ matrix.arch }}
-        id: check
+      - name: Get Firefox version from Packages.gz
+        id: get_version
         run: |
           ARCH="${{ matrix.arch }}"
           REPO_URL="https://packages-cf.termux.dev/apt/termux-x11/dists/x11/main"
-          updated=0
 
-          echo "Checking for $ARCH..."
-
+          echo "Fetching Packages.gz for $ARCH..."
           wget -qO - "$REPO_URL/binary-$ARCH/Packages.gz" | zgrep -A 10 '^Package: firefox$' > tmp.txt
 
           version=$(grep '^Version:' tmp.txt | head -n1 | sed 's/Version: //')
           filename=$(grep '^Filename:' tmp.txt | head -n1 | sed 's/Filename: //')
 
-          echo "Found version: $version"
+          echo "Found Firefox version: $version"
           echo "Filename: $filename"
 
-          # Get latest release tag
-          latest_release_url="https://api.github.com/repos/${{ github.repository }}/releases/latest"
-          latest_version=$(curl -s "$latest_release_url" | jq -r '.tag_name // ""')
-          echo "Latest release version: ${latest_version:-none}"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "filename=$filename" >> $GITHUB_OUTPUT
 
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ] || [ "$version" != "$latest_version" ]; then
-            echo "Updating $ARCH..."
-            debfile="firefox_${ARCH}.deb"
-            wget -O "$debfile" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
+      - name: Compare with latest release
+        id: check_update
+        run: |
+          version="${{ steps.get_version.outputs.version }}"
+          latest_release=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r '.tag_name // ""')
 
-            workdir="deb_extract_temp_$ARCH"
-            rm -rf "$workdir" firefox
-            mkdir -p "$workdir"
-            ar x "$debfile" --output="$workdir"
+          echo "Current version in Packages.gz: $version"
+          echo "Latest release version: ${latest_release:-none}"
 
-            if [ -f "$workdir/data.tar.xz" ]; then
-              tar -xf "$workdir/data.tar.xz" -C "$workdir"
-            elif [ -f "$workdir/data.tar.zst" ]; then
-              tar --zstd -xf "$workdir/data.tar.zst" -C "$workdir"
-            elif [ -f "$workdir/data.tar.gz" ]; then
-              tar -xf "$workdir/data.tar.gz" -C "$workdir"
-            else
-              echo "Error: data.tar.* not found in the .deb"
-              exit 1
-            fi
-
-            firefox_source="$workdir/data/data/com.termux/files/usr/lib/firefox"
-            if [ -d "$firefox_source" ]; then
-              cp -a "$firefox_source" "firefox"
-            else
-              echo "Error: Firefox folder not found at expected path"
-              exit 1
-            fi
-
-            tarfile="firefox_latest_${ARCH}.tar.xz"
-            tar -cJf "$tarfile" firefox
-
-            rm -rf "$workdir" "$debfile" firefox tmp.txt
-
-            echo "tarfile=$tarfile" >> $GITHUB_OUTPUT
-            echo "version=$version" >> $GITHUB_OUTPUT
-            echo "updated=1" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] || [ "$version" != "$latest_release" ]; then
+            echo "Update needed"
+            echo "update_needed=true" >> $GITHUB_OUTPUT
           else
-            echo "$ARCH is already up to date."
-            echo "updated=0" >> $GITHUB_OUTPUT
+            echo "Already up-to-date"
+            echo "update_needed=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Download and package Firefox
+        if: steps.check_update.outputs.update_needed == 'true'
+        run: |
+          ARCH="${{ matrix.arch }}"
+          filename="${{ steps.get_version.outputs.filename }}"
+
+          echo "Downloading Firefox for $ARCH..."
+          wget -O "firefox_$ARCH.deb" "https://packages-cf.termux.dev/apt/termux-x11/$filename"
+
+          echo "Extracting package..."
+          mkdir -p extract
+          ar x "firefox_$ARCH.deb" --output=extract
+
+          if [ -f "extract/data.tar.xz" ]; then
+            tar -xf "extract/data.tar.xz" -C extract
+          elif [ -f "extract/data.tar.zst" ]; then
+            tar --zstd -xf "extract/data.tar.zst" -C extract
+          else
+            echo "Error: No supported data archive found"
+            exit 1
+          fi
+
+          echo "Creating tarball..."
+          firefox_dir="extract/data/data/com.termux/files/usr/lib/firefox"
+          tar -cJf "firefox_latest_$ARCH.tar.xz" -C "$firefox_dir" .
+
+          echo "Cleaning up..."
+          rm -rf extract "firefox_$ARCH.deb"
+
       - name: Upload artifact
-        if: steps.check.outputs.updated == '1'
+        if: steps.check_update.outputs.update_needed == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.arch }}
-          path: ${{ steps.check.outputs.tarfile }}
+          name: firefox_${{ matrix.arch }}
+          path: firefox_latest_${{ matrix.arch }}.tar.xz
 
   release:
     needs: check
@@ -102,47 +102,35 @@ jobs:
         with:
           path: artifacts
 
-      - name: List files
-        run: ls -R artifacts || echo "No artifacts"
-
-      - name: Decide whether to release
-        id: decide
+      - name: Verify artifacts
         run: |
+          echo "Artifacts directory contents:"
+          ls -R artifacts
           artifact_count=$(find artifacts -name 'firefox_latest_*.tar.xz' | wc -l)
-          echo "Found $artifact_count updated artifacts."
+          echo "Found $artifact_count artifacts"
 
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "Manual run detected → force release."
-            echo "proceed=true" >> $GITHUB_OUTPUT
-          elif [ "$artifact_count" -eq 0 ]; then
-            echo "Nothing updated, skip release."
-            echo "proceed=false" >> $GITHUB_OUTPUT
-          else
-            echo "Updates found → proceed with release."
-            echo "proceed=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Get version for tag
-        id: version
+      - name: Set release version
+        id: set_version
         run: |
-          # Get version from first artifact (all should have same version)
           version="${{ needs.check.outputs.version }}"
-
           if [ -z "$version" ]; then
-            echo "Error: Could not determine version"
+            echo "Error: Could not determine version from check job"
             exit 1
           fi
-
           echo "Using version: $version"
           echo "tag=$version" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
-        if: steps.decide.outputs.proceed == 'true'
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: "Firefox Termux ${{ steps.version.outputs.tag }}"
-          files: artifacts/*/firefox_latest_*.tar.xz
+          tag_name: ${{ steps.set_version.outputs.tag }}
+          name: "Firefox Termux ${{ steps.set_version.outputs.tag }}"
+          files: |
+            artifacts/*/firefox_latest_aarch64.tar.xz
+            artifacts/*/firefox_latest_arm.tar.xz
+            artifacts/*/firefox_latest_x86_64.tar.xz
+            artifacts/*/firefox_latest_i686.tar.xz
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
