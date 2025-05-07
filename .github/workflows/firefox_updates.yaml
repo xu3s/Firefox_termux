@@ -95,7 +95,7 @@ jobs:
 
           # Handle different compression formats
           if [ -f "$temp_dir/extract/data.tar.xz" ]; then
-            tar -xf "$temp_dir/extract/data.tar.xz" -C "$temp_dir/extract"
+            tar -xvf "$temp_dir/extract/data.tar.xz" -C "$temp_dir/extract"
           elif [ -f "$temp_dir/extract/data.tar.zst" ]; then
             zstd -dc "$temp_dir/extract/data.tar.zst" | tar -x -C "$temp_dir/extract"
           else
@@ -104,7 +104,7 @@ jobs:
           fi
 
           echo "Creating tarball..."
-          firefox_dir="$temp_dir/extract/data/data/com.termux/files/usr/lib/firefox"
+          firefox_dir="$temp_dir/extract/data/data/com.termux/files/usr/lib"
           if [ ! -d "$firefox_dir" ]; then
             echo "::error::Firefox directory not found at expected path"
             exit 1
